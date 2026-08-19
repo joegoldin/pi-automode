@@ -11,9 +11,9 @@ The fork is kept deliberately additive, so upstream replays underneath it.
 
 New files. Upstream has nothing at these paths, so a rebase never touches them.
 
-- `extensions/auto-mode/permission-chain.ts` — the whole integration
-- `tests/permission-chain.test.ts` — its tests
-- `docs/REBASING.md` — this file
+- `extensions/auto-mode/permission-chain.ts`, the whole integration
+- `tests/permission-chain.test.ts`, its tests
+- `docs/REBASING.md`, this file
 
 ## What we edit upstream
 
@@ -32,7 +32,7 @@ Nothing under `extensions/auto-mode/` other than the new file is touched. In
 particular `extension.ts`, which holds the decision pipeline, is upstream's
 byte for byte: the wrapper intercepts the factory's `pi.on("tool_call", …)`
 registration rather than editing the handler, and calls that same handler from
-the chain link. That is the property worth protecting on every rebase — a
+the chain link. That is the property worth protecting on every rebase. A
 verdict the link returns and a verdict the standalone gate returns come from
 one piece of code, so they cannot drift.
 
@@ -61,15 +61,15 @@ That must print nothing.
 
 ## What upstream could change that would need real work
 
-- **Moving the `tool_call` registration out of the factory** — into a
-  standalone export, say, or behind a second `pi.on` call. The shim captures
+- **Moving the `tool_call` registration out of the factory**, into a
+  standalone export or behind a second `pi.on` call. The shim captures
   exactly one `tool_call` handler; a second registration would silently replace
   the first. `tests/permission-chain.test.ts` does not catch that, because the
   fake host it drives is ours.
 - **Changing `ToolCallEventResult`** from `{ block, reason }`. The link maps
   `block` to a chain `deny` and everything else to `allow`.
-- **Taking `input` apart differently** — a bash command read from somewhere
-  other than `input.command`, say. The projection in `eventFromDetails` mirrors
+- **Taking `input` apart differently**, a bash command read from somewhere
+  other than `input.command`. The projection in `eventFromDetails` mirrors
   `getPrimaryArgument` and `extractInputPath`, and is used only for asks with
   no local tool call (a forwarded subagent ask, or a load order that puts the
   permission system first).
