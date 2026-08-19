@@ -280,7 +280,25 @@ export type PermissionChainOptions = {
   readActivation?: (cwd: string) => ChainActivation;
   /** Injected in tests. Production loads auto mode's effective config. */
   loadConfig?: (cwd: string) => EffectiveConfig;
+  /**
+   * Read the environment. Injected in tests; production reads `process.env`.
+   */
+  env?: Record<string, string | undefined>;
 };
+
+/**
+ * Set to `1` to stop auto mode drawing its own status slot.
+ *
+ * The slot is suppressed rather than the numbers thrown away: the rendered
+ * text is republished on {@link AUTO_MODE_STATUS_CHANNEL} so a status line that
+ * owns the footer can render the same counts in its own style. Auto mode has no
+ * setting for this and calls `ctx.ui.setStatus` unconditionally, so the shim
+ * below is where it has to happen.
+ */
+export const SUPPRESS_STATUS_ENV = "PI_AUTOMODE_NO_STATUS_SLOT";
+
+/** Channel carrying auto mode's status text when the slot is suppressed. */
+export const AUTO_MODE_STATUS_CHANNEL = "pi-automode:status";
 
 /**
  * Wrap an auto mode extension so it can act as a permission-system chain link.
@@ -299,6 +317,8 @@ export function withPermissionChain(
   const globalObject = options.global ?? globalThis;
   const readActivation = options.readActivation ?? readChainActivation;
   const loadConfig = options.loadConfig ?? loadEffectiveConfig;
+  const env = options.env ?? process.env;
+  const suppressStatus = env[SUPPRESS_STATUS_ENV] === "1";
 
   return function piAutomodeWithPermissionChain(pi: ExtensionAPI): void {
     let toolCall: ToolCallHandler | undefined;
@@ -306,6 +326,65 @@ export function withPermissionChain(
     let lastCtx: ExtensionContext | undefined;
     let config: EffectiveConfig | undefined;
     const seen = new Map<string, { event: ToolCallEvent; ctx: ExtensionContext }>();
+
+    /**
+     * Hand a handler a context whose `setStatus` drops auto mode's own slot.
+     *
+     * Only the `pi-automode` key is intercepted, and only when suppression is
+     * on; every other key and every other `ui` member passes through, so an
+     * upstream that starts writing a second slot keeps working. The text is
+     * republished rather than discarded, because the counts are the point and
+     * only auto mode knows them.
+     */
+    function wrapCtx(ctx: ExtensionContext): ExtensionContext {
+      const ui = (ctx as { ui?: Record<string, unknown> } | undefined)?.ui;
+      if (!suppressStatus || !ui || typeof ui.setStatus !== "function") {
+        return ctx;
+      }
+      const uiShim = new Proxy(ui, {
+        get(uiTarget, uiProperty, uiReceiver) {
+          if (uiProperty === "setStatus") {
+            return (key: string, text: string | undefined): void => {
+              if (key === "pi-automode") {
+                publishStatus(text);
+                return;
+              }
+              (uiTarget.setStatus as (k: string, t?: string) => void).call(
+                uiTarget,
+                key,
+                text,
+              );
+            };
+          }
+          const uiValue = Reflect.get(uiTarget, uiProperty, uiReceiver);
+          return typeof uiValue === "function"
+            ? uiValue.bind(uiTarget)
+            : uiValue;
+        },
+      });
+      return new Proxy(ctx as object, {
+        get(ctxTarget, ctxProperty, ctxReceiver) {
+          if (ctxProperty === "ui") return uiShim;
+          const ctxValue = Reflect.get(ctxTarget, ctxProperty, ctxReceiver);
+          return typeof ctxValue === "function"
+            ? ctxValue.bind(ctxTarget)
+            : ctxValue;
+        },
+      }) as ExtensionContext;
+    }
+
+    function publishStatus(text: string | undefined): void {
+      const events = (pi as { events?: { emit?: unknown } }).events;
+      if (typeof events?.emit !== "function") return;
+      try {
+        (events.emit as (channel: string, data: unknown) => void)(
+          AUTO_MODE_STATUS_CHANNEL,
+          { text: text ?? "" },
+        );
+      } catch {
+        // A status line is cosmetic and must never break a tool call.
+      }
+    }
 
     const shim = new Proxy(pi, {
       get(target, property, receiver) {
@@ -315,10 +394,17 @@ export function withPermissionChain(
               toolCall = handler as ToolCallHandler;
               return;
             }
+            const wrapped = suppressStatus && typeof handler === "function"
+              ? (e: unknown, ctx: ExtensionContext) =>
+                (handler as (e: unknown, c: ExtensionContext) => unknown)(
+                  e,
+                  wrapCtx(ctx),
+                )
+              : handler;
             (target.on as (e: string, h: unknown) => void).call(
               target,
               event,
-              handler,
+              wrapped,
             );
           };
         }
@@ -359,7 +445,7 @@ export function withPermissionChain(
           return { kind: "defer" };
         }
 
-        const result = await toolCall(event, ctx);
+        const result = await toolCall(event, wrapCtx(ctx));
         if (result?.block) {
           log.review(AUTHORIZER_NAME, {
             requestId: details.requestId,
@@ -438,7 +524,7 @@ export function withPermissionChain(
       // Standalone: no permission system, or a registration that never took.
       // Upstream's gate runs here, unchanged.
       if (!registered || getPermissionsService(globalObject) === undefined) {
-        return toolCall(event, ctx);
+        return toolCall(event, wrapCtx(ctx));
       }
 
       remember(event, ctx);
