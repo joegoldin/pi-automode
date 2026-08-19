@@ -1,0 +1,453 @@
+/**
+ * Coexistence with `@gotgenes/pi-permission-system`.
+ *
+ * Both packages register pi's `tool_call` event. pi's `emitToolCall` walks the
+ * extensions in `--extension` order and returns on the first `{ block: true }`,
+ * so two gates on that event are a contention rather than a composition: the
+ * one loaded first answers, and the other one is reached only for calls the
+ * first had no opinion about.
+ *
+ * The permission system publishes a way out. It puts a typed service on
+ * `Symbol.for("@gotgenes/pi-permission-system:service")` with
+ * `registerAuthorizer(name, authorize)`, a seam it consults only for an `ask`
+ * its own deterministic engine could not settle. A link there is not a second
+ * gate; it is the answer to the question the first gate could not answer. This
+ * module registers auto mode on that seam.
+ *
+ * Three things it is careful about:
+ *
+ * 1. **No dependency on the other package.** The symbol slot is read off
+ *    `globalThis` rather than imported. With the permission system absent the
+ *    slot is empty, nothing registers, and the `tool_call` handler upstream
+ *    wrote runs exactly as it does today.
+ *
+ * 2. **One pipeline, not two.** The link does not re-derive a verdict. It calls
+ *    upstream's own `tool_call` handler with the real event and returns its
+ *    result, so the deterministic tiers, the fast paths, the classifier, the
+ *    fail-closed arms, the counters and the decision log are the same code in
+ *    both modes.
+ *
+ * 3. **`defer`, never `allow`, on our own failure.** A chain link that fails
+ *    open widens permissions. Deferring hands the ask back to the chain owner,
+ *    whose own prompt is the fail-closed behaviour at that layer.
+ *
+ * Registration is not activation. The permission system consults a link only
+ * once the operator names it in `authorizerChain`, in that package's own config
+ * file, which is why this module reads that file at session start and says so
+ * loudly when the name is missing. A registered link nobody named is inert, and
+ * inert reads exactly like working.
+ */
+
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ToolCallEvent,
+  ToolCallEventResult,
+} from "@earendil-works/pi-coding-agent";
+import { loadEffectiveConfig } from "./config.ts";
+import { HOME, PATH_BEARING_TOOLS } from "./constants.ts";
+import { deterministicHardDeny } from "./hard-deny.ts";
+import {
+  expandHomePattern,
+  extractInputPath,
+  resolveInputPath,
+  resolvePathForPolicy,
+} from "./paths.ts";
+import { matchesDeniedPath, matchesToolPattern } from "./permissions.ts";
+import type { EffectiveConfig } from "./types.ts";
+
+/** The slot `@gotgenes/pi-permission-system` publishes its service on. */
+export const PERMISSION_SERVICE_KEY = Symbol.for(
+  "@gotgenes/pi-permission-system:service",
+);
+
+/** Emitted at that package's `session_start`, after the service is published. */
+export const PERMISSIONS_READY_CHANNEL = "permissions:ready";
+
+/** The name the operator writes into `authorizerChain` to activate the link. */
+export const AUTHORIZER_NAME = "pi-automode";
+
+/** That package's own config file, relative to `PI_CODING_AGENT_DIR`. */
+export const PERMISSION_CONFIG_RELPATH = join(
+  "extensions",
+  "pi-permission-system",
+  "config.json",
+);
+
+/** A non-terminal link's ruling: decide, or pass the ask to the next link. */
+export type AuthorizerVerdict =
+  | { kind: "allow" }
+  | { kind: "deny"; reason?: string }
+  | { kind: "defer" };
+
+/** The review-log seam the chain owner injects at `authorize` time. */
+export interface AuthorizerLogLike {
+  review(event: string, details?: Record<string, unknown>): void;
+  debug(event: string, details?: Record<string, unknown>): void;
+}
+
+export type AuthorizeFn = (
+  details: Record<string, unknown>,
+  query: unknown,
+  log: AuthorizerLogLike,
+) => Promise<AuthorizerVerdict>;
+
+/** Only the one method we call. Structural, so nothing is imported. */
+export interface PermissionsServiceLike {
+  registerAuthorizer(name: string, authorize: AuthorizeFn): () => void;
+}
+
+/**
+ * The published service, or `undefined` when the permission system is absent.
+ *
+ * Read per use rather than cached: the package republishes on `/reload`, and a
+ * cached reference would keep answering for a torn-down generation.
+ */
+export function getPermissionsService(
+  global: typeof globalThis = globalThis,
+): PermissionsServiceLike | undefined {
+  const slot = (global as unknown as Record<symbol, unknown>)[
+    PERMISSION_SERVICE_KEY
+  ];
+  if (typeof slot !== "object" || slot === null) return undefined;
+  const candidate = slot as PermissionsServiceLike;
+  return typeof candidate.registerAuthorizer === "function"
+    ? candidate
+    : undefined;
+}
+
+function str(value: unknown): string | undefined {
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
+
+/** `PI_CODING_AGENT_DIR`, or pi's default when it is unset. */
+export function agentDir(
+  env: Record<string, string | undefined> = process.env,
+): string {
+  return env.PI_CODING_AGENT_DIR || join(HOME, ".pi", "agent");
+}
+
+/** The two files the permission system reads its `authorizerChain` from. */
+export function authorizerChainPaths(cwd: string, dir = agentDir()): string[] {
+  return [
+    join(dir, PERMISSION_CONFIG_RELPATH),
+    join(cwd, ".pi", PERMISSION_CONFIG_RELPATH),
+  ];
+}
+
+export type ChainActivation = {
+  /** Whether some config file names {@link AUTHORIZER_NAME}. */
+  active: boolean;
+  /** Files that existed and parsed. */
+  read: string[];
+  /** Every link name seen, in the order the files were read. */
+  names: string[];
+};
+
+/**
+ * Whether the operator has named this link in `authorizerChain`.
+ *
+ * A diagnostic, never a control input: the link registers and answers
+ * regardless of what this reads. Its whole job is to make the difference
+ * between "registered" and "activated" visible, because that difference has
+ * already shipped once as a silent no-op here.
+ */
+export function readChainActivation(
+  cwd: string,
+  dir = agentDir(),
+): ChainActivation {
+  const read: string[] = [];
+  const names: string[] = [];
+  for (const path of authorizerChainPaths(cwd, dir)) {
+    if (!existsSync(path)) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(path, "utf8"));
+    } catch {
+      continue;
+    }
+    read.push(path);
+    const chain = (parsed as { authorizerChain?: unknown } | null)
+      ?.authorizerChain;
+    if (Array.isArray(chain)) {
+      for (const entry of chain) if (typeof entry === "string") names.push(entry);
+    }
+  }
+  return { active: names.includes(AUTHORIZER_NAME), read, names };
+}
+
+/**
+ * Project a `PromptPermissionDetails` onto the tool-call event the pipeline
+ * takes.
+ *
+ * The fallback path. When auto mode is loaded ahead of the permission system
+ * its own `tool_call` handler has already seen the real event and the link uses
+ * that instead, complete input and all. This covers the two cases where no real
+ * event was seen locally: an ask forwarded from a subagent, and an auto mode
+ * loaded after the permission system.
+ *
+ * The input is reconstructed under the key each tool actually uses, because
+ * that is what `matchesToolPattern` and `extractInputPath` read.
+ */
+export function eventFromDetails(
+  details: Record<string, unknown>,
+): ToolCallEvent | undefined {
+  const facts = (details.payload as { request?: Record<string, unknown> } | undefined)
+    ?.request;
+  const toolName = str(details.toolName) ?? str(facts?.toolName);
+  if (toolName === undefined) return undefined;
+  const value =
+    str(details.command) ??
+    str(details.path) ??
+    str(details.target) ??
+    str(details.value) ??
+    str(facts?.value) ??
+    "";
+  const input: Record<string, unknown> =
+    toolName === "bash"
+      ? { command: value }
+      : PATH_BEARING_TOOLS.has(toolName)
+      ? { path: value }
+      : { value };
+  return {
+    type: "tool_call",
+    toolCallId: str(details.toolCallId) ?? "",
+    toolName,
+    input,
+  } as unknown as ToolCallEvent;
+}
+
+/**
+ * The deterministic tiers, and only those, for the delegated pre-pass.
+ *
+ * When the permission system owns layer 2 the classifier runs as this package's
+ * chain link, so running the whole gate on `tool_call` as well would classify
+ * every action twice and would defeat the deterministic allow rules the
+ * permission system resolves without a model call. What stays on `tool_call` is
+ * the half that costs nothing and that a permission-system `allow` would
+ * otherwise sail past: the operator's own deny list, the deterministic
+ * hard-deny checks, and the path deny list. Same three checks, same order, same
+ * predicates as the full gate.
+ */
+export function deterministicDenial(
+  config: EffectiveConfig,
+  event: ToolCallEvent,
+  cwd: string,
+): string | undefined {
+  const input = event.input as Record<string, unknown>;
+
+  for (const pattern of config.permissionDeny) {
+    if (matchesToolPattern(pattern, event.toolName, input, cwd)) {
+      return `Blocked by permissions.deny: ${pattern.raw}`;
+    }
+  }
+
+  const hardDeny = deterministicHardDeny(event.toolName, input, cwd);
+  if (hardDeny) return hardDeny;
+
+  if (config.deniedPaths.length > 0 && PATH_BEARING_TOOLS.has(event.toolName)) {
+    const inputPath = extractInputPath(event.toolName, input);
+    if (inputPath !== undefined) {
+      const expanded = expandHomePattern(inputPath);
+      const resolved = resolveInputPath(cwd, expanded) ?? expanded;
+      const policyPath = resolvePathForPolicy(resolved) ?? resolved;
+      if (
+        matchesDeniedPath(resolved, config.deniedPaths) ||
+        matchesDeniedPath(policyPath, config.deniedPaths)
+      ) {
+        return `Path denied by policy: ${policyPath}`;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+type ToolCallHandler = (
+  event: ToolCallEvent,
+  ctx: ExtensionContext,
+) => Promise<ToolCallEventResult | undefined> | ToolCallEventResult | undefined;
+
+/** How many recent tool calls the link can look up by id. */
+const SEEN_LIMIT = 32;
+
+export type PermissionChainOptions = {
+  /** Injected in tests so no test needs a real `globalThis` slot. */
+  global?: typeof globalThis;
+  /** Injected in tests. Production reads the permission system's own file. */
+  readActivation?: (cwd: string) => ChainActivation;
+  /** Injected in tests. Production loads auto mode's effective config. */
+  loadConfig?: (cwd: string) => EffectiveConfig;
+};
+
+/**
+ * Wrap an auto mode extension so it can act as a permission-system chain link.
+ *
+ * Upstream's `tool_call` registration is intercepted rather than edited: the
+ * factory is handed a shim whose `on("tool_call", …)` captures the handler
+ * instead of registering it, and this module registers a wrapper that decides
+ * per call whether to run that handler here or hold it for the chain. Every
+ * other API call passes straight through. That keeps the whole integration in
+ * one file upstream does not have, so a rebase never has to merge it.
+ */
+export function withPermissionChain(
+  inner: (pi: ExtensionAPI) => void,
+  options: PermissionChainOptions = {},
+): (pi: ExtensionAPI) => void {
+  const globalObject = options.global ?? globalThis;
+  const readActivation = options.readActivation ?? readChainActivation;
+  const loadConfig = options.loadConfig ?? loadEffectiveConfig;
+
+  return function piAutomodeWithPermissionChain(pi: ExtensionAPI): void {
+    let toolCall: ToolCallHandler | undefined;
+    let registered = false;
+    let lastCtx: ExtensionContext | undefined;
+    let config: EffectiveConfig | undefined;
+    const seen = new Map<string, { event: ToolCallEvent; ctx: ExtensionContext }>();
+
+    const shim = new Proxy(pi, {
+      get(target, property, receiver) {
+        if (property === "on") {
+          return (event: string, handler: unknown): void => {
+            if (event === "tool_call") {
+              toolCall = handler as ToolCallHandler;
+              return;
+            }
+            (target.on as (e: string, h: unknown) => void).call(
+              target,
+              event,
+              handler,
+            );
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as ExtensionAPI;
+
+    inner(shim);
+
+    function remember(event: ToolCallEvent, ctx: ExtensionContext): void {
+      if (!event.toolCallId) return;
+      seen.set(event.toolCallId, { event, ctx });
+      // One tool call raises several permission requests, so an entry is kept
+      // rather than consumed; the cap is what bounds the map instead.
+      while (seen.size > SEEN_LIMIT) {
+        const oldest = seen.keys().next();
+        if (oldest.done) break;
+        seen.delete(oldest.value);
+      }
+    }
+
+    function effectiveConfig(cwd: string): EffectiveConfig {
+      config ??= loadConfig(cwd);
+      return config;
+    }
+
+    const authorize: AuthorizeFn = async (details, _query, log) => {
+      try {
+        const cached = seen.get(str(details.toolCallId) ?? "");
+        const event = cached?.event ?? eventFromDetails(details);
+        const ctx = cached?.ctx ?? lastCtx;
+        if (event === undefined || ctx === undefined || toolCall === undefined) {
+          log.debug(AUTHORIZER_NAME, {
+            requestId: details.requestId,
+            deferred: "no tool call to review",
+          });
+          return { kind: "defer" };
+        }
+
+        const result = await toolCall(event, ctx);
+        if (result?.block) {
+          log.review(AUTHORIZER_NAME, {
+            requestId: details.requestId,
+            decision: "deny",
+            projected: cached === undefined,
+            reason: result.reason,
+          });
+          return { kind: "deny", reason: result.reason };
+        }
+        log.review(AUTHORIZER_NAME, {
+          requestId: details.requestId,
+          decision: "allow",
+          projected: cached === undefined,
+        });
+        return { kind: "allow" };
+      } catch (error) {
+        // Our own failure, not a verdict. Defer: the chain owner's prompt is
+        // the fail-closed behaviour at that layer, and an `allow` here would
+        // widen permissions on an exception.
+        log.debug(AUTHORIZER_NAME, {
+          requestId: details.requestId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return { kind: "defer" };
+      }
+    };
+
+    function register(): boolean {
+      const service = getPermissionsService(globalObject);
+      if (service === undefined) return false;
+      try {
+        service.registerAuthorizer(AUTHORIZER_NAME, authorize);
+        registered = true;
+      } catch {
+        // Duplicate registration throws by contract. Leave the latch alone: a
+        // second `permissions:ready` after a successful registration is the
+        // common cause, and dropping back to the standalone gate there would
+        // classify every action twice.
+      }
+      return registered;
+    }
+
+    // Optional chaining because a host that predates the shared bus still gets
+    // the load-time registration below, and the whole module stays inert rather
+    // than throwing on an API it cannot see.
+    pi.events?.on(PERMISSIONS_READY_CHANNEL, () => {
+      register();
+    });
+    register();
+
+    pi.on("session_start", (_event, ctx) => {
+      lastCtx = ctx;
+      seen.clear();
+      config = undefined;
+      if (getPermissionsService(globalObject) === undefined) return;
+      const activation = readActivation(ctx.cwd);
+      pi.appendEntry("pi-automode-chain", {
+        registered,
+        ...activation,
+        name: AUTHORIZER_NAME,
+      });
+      if (activation.active || !ctx.hasUI) return;
+      ctx.ui.notify(
+        `pi-automode registered as an authorizer chain link but ` +
+          `"${AUTHORIZER_NAME}" is not in authorizerChain, so the ` +
+          `permission system will never consult it. Add it to ` +
+          `${authorizerChainPaths(ctx.cwd)[0]}.`,
+        "warning",
+      );
+    });
+
+    pi.on("tool_call", async (event, ctx) => {
+      lastCtx = ctx;
+      if (toolCall === undefined) return undefined;
+
+      // Standalone: no permission system, or a registration that never took.
+      // Upstream's gate runs here, unchanged.
+      if (!registered || getPermissionsService(globalObject) === undefined) {
+        return toolCall(event, ctx);
+      }
+
+      remember(event, ctx);
+      const cfg = effectiveConfig(ctx.cwd);
+      if (!cfg.enabled) return undefined;
+      const denial = deterministicDenial(cfg, event, ctx.cwd);
+      return denial === undefined
+        ? undefined
+        : { block: true, reason: `[pi-automode] ${denial}` };
+    });
+  };
+}
