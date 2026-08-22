@@ -337,7 +337,9 @@ export function withPermissionChain(
      * only auto mode knows them.
      */
     function wrapCtx(ctx: ExtensionContext): ExtensionContext {
-      const ui = (ctx as { ui?: Record<string, unknown> } | undefined)?.ui;
+      const ui = (
+        ctx as unknown as { ui?: Record<string, unknown> } | undefined
+      )?.ui;
       if (!suppressStatus || !ui || typeof ui.setStatus !== "function") {
         return ctx;
       }
