@@ -12,11 +12,12 @@ For each Pi `tool_call` event, the extension does this:
 4. Check `permissions.deny` rules.
 5. Check `permissions.ask` rules and ask the user when needed.
 6. Run deterministic hard-deny checks.
-7. Run the path gate: `deniedPaths` matches block locally; with `allowInsideWorkingDirectory`, in-tree non-protected file access is allowed without a classifier call.
-8. Allow read-only built-in tools without a classifier call, unless `classifyReadOnlyTools` routes them through the classifier.
-9. Send every remaining action, including all writes and edits, through a one-token conservative filter.
-10. Run structured classifier review only when the filter requests it, then allow or block.
-11. Persist state and update the UI status/denial history.
+7. Let the extension-owned `automode_inspect` tool run without classification, counters, state persistence, or logging.
+8. Run the path gate: `deniedPaths` matches block locally; with `allowInsideWorkingDirectory`, in-tree non-protected file access is allowed without a classifier call.
+9. Allow read-only built-in tools without a classifier call, unless `classifyReadOnlyTools` routes them through the classifier.
+10. Send every remaining action, including all writes and edits, through a one-token conservative filter.
+11. Run structured classifier review only when the filter requests it, then allow or block.
+12. Persist state and update the UI status/denial history.
 
 The default posture is fail-closed. If the classifier cannot be resolved, has no API key, errors, or returns an invalid stage response, the action is blocked.
 
@@ -29,9 +30,7 @@ flowchart TD
   C -- no --> Z[Let tool run]
   C -- yes --> D{ctx.signal aborted?}
   D -- yes --> X[Block: cancelled]
-  D -- no --> E[Summarize action]
-
-  E --> F{Matches permissions.deny?}
+  D -- no --> F{Matches permissions.deny?}
   F -- yes --> F1[Block locally]
   F -- no --> G{Matches permissions.ask?}
 
@@ -44,7 +43,9 @@ flowchart TD
 
   J --> K{Deterministic hard-deny?}
   K -- yes --> K1[Block locally]
-  K -- no --> K2{Path gate: deniedPaths match or in-tree allow tier?}
+  K -- no --> E{Extension-owned automode_inspect?}
+  E -- yes --> E1[Allow without state or log changes]
+  E -- no --> K2{Path gate: deniedPaths match or in-tree allow tier?}
 
   K2 -- denied --> K1[Block locally]
   K2 -- in-tree, non-protected --> L1[Allow locally]
@@ -274,6 +275,8 @@ No classifier model/API key available; auto mode fails closed.
 
 Classifier calls use `ctx.signal`, a stable classifier-specific session ID, and `cacheRetention: "short"`. They do not force a temperature, because some providers reject the parameter; provider defaults are used instead. Unsupported providers ignore cache affinity.
 
+Each classifier request (fast stage and detailed stage separately) is also capped by `autoMode.classifierTimeoutMs` (default 20000 ms). A request that exceeds the budget — for example a provider stream that stalls mid-response — is aborted and the action is blocked, exactly like any other classifier error.
+
 The fast stage requires one visible digit but allows `maxTokens: 512`, because reasoning and OpenAI-compatible models may consume hidden reasoning, control, and end-of-sequence tokens before emitting it. Extra visible content still fails parsing. Detailed review uses `maxTokens: 1200` and may retry once after malformed or truncated output.
 
 ## Parsing the classifier result
@@ -310,6 +313,14 @@ Blocked actions also increment `blockedActions` and add a denial record. Denial 
 Recent denial history is capped at 12 entries. State is persisted with `pi.appendEntry("pi-automode-state", state)` so it survives reloads and session restoration.
 
 When UI is available, the extension updates the footer status and shows a warning notification for blocked actions.
+
+## Agent inspection tool
+
+`automode_inspect` exposes `status`, `config`, `defaults`, and `denials` views to the agent. The extension verifies the registered tool's source before applying the exemption, so an earlier extension using the same name still goes through normal enforcement. Every view is read-only. After permission and deterministic checks pass, the hook returns before classifier routing, counters, state persistence, and observability logging.
+
+Tool output becomes model context. The `status` and `denials` views therefore omit denial reasons and action summaries. The `config` view contains effective rule text and should not be used to store secrets.
+
+No state-changing command has a tool equivalent. The user must run `/automode on`, `/automode off`, `/automode reload`, `/automode reset`, and `/automode model` directly. See [Agent diagnostics](diagnostics.md) for the inspection contract, privacy limits, and diagnosis workflow.
 
 ## Command interactions
 

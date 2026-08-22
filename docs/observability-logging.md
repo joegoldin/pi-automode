@@ -1,6 +1,6 @@
 # Observability logging
 
-Auto mode can write a JSONL observability log next to the current Pi session file, so you can inspect decisions and classifier usage. It is off by default and fail-open: a write error never changes an allow/block decision.
+Auto mode can write a JSONL observability log so you can inspect decisions and classifier usage. Persisted sessions use a sidecar next to the Pi session file; in-memory sessions use an application-owned global directory. Logging is off by default and fail-open: a write error never changes an allow/block decision.
 
 ## Enabling
 
@@ -33,9 +33,19 @@ The log file is colocated with the current Pi session file, with `-pi-automode` 
 <session-file>-pi-automode.jsonl     →  <dir>/<id>-pi-automode.jsonl
 ```
 
-For example: `~/.pi/agent/sessions/<slug>/<id>-pi-automode.jsonl`. If no session file is set, it falls back to `<sessionDir>/<sessionId>-pi-automode.jsonl`. Run `/automode config` to see the resolved path.
+For example: `~/.pi/agent/sessions/<slug>/<id>-pi-automode.jsonl`. If a custom session manager provides an absolute, non-empty session directory but no session file, the log falls back to `<sessionDir>/<sessionId>-pi-automode.jsonl`.
 
-There is one combined file per session. Each line is one JSON object with a `type` discriminator. Entries for the same tool call share a `decisionId`.
+Pi in-memory sessions, including `--no-session` and non-persisted subagents, intentionally have neither a session file nor a session directory. Their logs use an absolute application-owned path instead of a relative filename in the launching process directory:
+
+```text
+~/.pi/agent/extensions/pi-automode/logs/<encoded-session-cwd>/YYYY-MM-DD/<session-id>-pi-automode.jsonl
+```
+
+The project directory uses the same `--path-with-dashes--` encoding style as Pi's normal session directories, and the date partition is UTC. A custom session manager that supplies an absolute non-empty `sessionDir` without a session file continues to use that directory. Run `/automode config` to see the resolved path for the current session.
+
+Persisted sessions use one combined file per session. In-memory sessions use one file per session ID per UTC day, so a session that crosses midnight continues in the next day's file. Each line is one JSON object with a `type` discriminator. Entries for the same tool call share a `decisionId`.
+
+For persisted sessions, `ccusage pi` continues to report the sidecar as a separate `-pi-automode` session. In-memory logs live outside Pi's normal session tree and may need to be inspected directly.
 
 ## Entry types
 
@@ -82,7 +92,7 @@ One per classifier model response, including malformed responses that trigger a 
 | `message.model` | model ID returned by the classifier provider |
 | `message.usage` | provider-reported input, output, cache, total-token, and cost fields |
 
-`ccusage` reports this sidecar as a separate `-pi-automode` session. This entry contains no prompt or response text, so it is written even when `classifierIo` is off.
+For persisted sessions, `ccusage` reports this sidecar as a separate `-pi-automode` session. This entry contains no prompt or response text, so it is written even when `classifierIo` is off.
 
 ### `classifier`
 

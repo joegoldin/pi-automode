@@ -43,6 +43,23 @@ pi -e ./extensions/auto-mode.ts
 
 `/auto-mode` is an alias.
 
+## Agent diagnostics
+
+The package registers one model-callable, read-only tool:
+
+`automode_inspect` accepts one `action`:
+
+- `status`: active state and counters
+- `config`: active effective config, log path, and diagnostics
+- `defaults`: built-in rule lists
+- `denials`: recent denial timestamps, kinds, and tool names
+
+The tool reads the same in-memory config and state that the guardrail enforces. After permission and deterministic checks pass, it bypasses classification without changing automode counters, persisted state, or observability logs. The extension verifies tool provenance before applying this exemption, so a name collision does not exempt another extension's implementation. The tool cannot enable, disable, reload, reset, select a model, or change configuration.
+
+Tool output is sent to the current model. The `status` and `denials` views omit denial reasons and action payloads; inspect a known-safe reason from the local observability log when diagnosis requires it. The `config` view includes effective rule text but strips raw JSON parser details from diagnostics. Do not put credentials or other secrets in automode rules.
+
+The bundled `automode-diagnostics` skill uses this tool to diagnose unexpected decisions without asking the user to copy output from slash commands. Configuration edits and automode state changes remain user-controlled. See [Agent diagnostics](docs/diagnostics.md) for the inspection contract, privacy limits, and diagnosis workflow.
+
 ## Status line
 
 When the Pi TUI is available, the extension renders a persistent status line:
@@ -90,6 +107,8 @@ Set a global default classifier model in `~/.pi/agent/automode.json`; override i
 
 `classifierReasoningLevel` optionally requests `low`, `medium`, `high`, `xhigh`, or `max` reasoning for both classifier stages. If the key is absent, pi-automode sends no reasoning preference and leaves the choice to the server. Pi AI clamps unsupported values to the nearest level supported by the selected model; a non-reasoning model resolves to `off`. `low` matches Codex Auto Review's reasoning effort and the practical default when an explicit value is needed. Higher levels can consume the existing 512/1200-token stage limits before producing visible output, which causes the classifier to fail closed. Raise `fastClassifierMaxTokens` (default 512, integer ≥ 16) if you run a reasoning model whose fast-stage budget is truncated before it emits the required `0`/`1` digit.
 
+`classifierTimeoutMs` (default 20000) caps each classifier completion request at the given number of milliseconds. The fast and detailed stages are separate requests, each with its own budget. A request that stalls or exceeds the budget is aborted and auto mode fails closed, blocking the action — a hung provider response can no longer stall the agent for minutes. Set it to an integer of at least 1000.
+
 `allowInsideWorkingDirectory` (default `false`) adds a deterministic silent-allow tier for the file tools (`read`, `write`, `edit`, `grep`, `find`, `ls`): when `true`, a call whose resolved path is inside the working directory is allowed without any classifier call, and file access outside the working directory is routed to the classifier (including reads, which would otherwise take the read-only fast path). This matches the Codex/Claude Code "inside the sandbox = silent, outside = review" model. The tier takes precedence over `classifyReadOnlyTools`: with both enabled, in-tree file access is still allowed without a classifier call, and out-of-tree file access is classified. `classifyReadOnlyTools: true` only routes in-tree reads to the classifier when `allowInsideWorkingDirectory` is `false`. Writes and edits to protected in-tree paths (`.git/hooks`, `.pi` controls, shell profiles, config files) are exempt from the silent-allow tier and still go to the classifier.
 
 `deniedPaths` (default `[]`) is a list of path glob patterns that are hard-denied before the classifier and before the inside-working-directory tier — the file-tool equivalent of a secret/system deny list. Patterns support `~`, `$HOME`, and `${HOME}` expansion and `*` (which matches any characters, including `/`, so `**/id_rsa` matches a private key at any depth). Matching checks both the path as typed and its symlink-resolved form, so a `~/.ssh/*` rule still matches when `~/.ssh` is a symlink. A matching path blocks the call unconditionally (no classifier, no override). The deny list applies to file tools only; `bash` path access is governed by the classifier. Both keys follow the normal scalar/array precedence.
@@ -105,6 +124,7 @@ Example:
     "classifierReasoningLevel": "low",
     "classifyReadOnlyTools": false,
     "fastClassifierMaxTokens": 512,
+    "classifierTimeoutMs": 20000,
     "allowInsideWorkingDirectory": false,
     "deniedPaths": [],
     "maxUserTranscriptTokens": 4000,
@@ -143,7 +163,7 @@ See [Defaults and rule-list behavior](docs/defaults.md) for built-in `environmen
 
 ### Observability logging
 
-Auto mode can write a JSONL observability log next to the current Pi session file, so you can inspect decisions and classifier usage. It is off by default.
+Auto mode can write a JSONL observability log so you can inspect decisions and classifier usage. Persisted sessions use a sidecar next to the Pi session file; in-memory sessions use an application-owned global directory. It is off by default.
 
 ```json
 {
@@ -156,7 +176,7 @@ Auto mode can write a JSONL observability log next to the current Pi session fil
 }
 ```
 
-With logging enabled, the sidecar also writes ccusage-compatible entries for every classifier response. `ccusage pi` reports this usage as a separate `-pi-automode` session even when `classifierIo` is off.
+With logging enabled, persisted-session sidecars also write ccusage-compatible entries for every classifier response. `ccusage pi` reports this usage as a separate `-pi-automode` session even when `classifierIo` is off. In-memory logs use the same entry shape but live outside Pi's normal session tree.
 
 See [Observability logging](docs/observability-logging.md) for the log file location, entry schema, and the `classifierIo` privacy tradeoff. Run `/automode config` to see the resolved log file path.
 

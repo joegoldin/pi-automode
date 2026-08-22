@@ -101,6 +101,10 @@ The selector keeps the first and latest user messages as intent anchors, then fi
 
 These are approximate limits based on character counts, not provider-tokenizer guarantees. Override either value with an integer of at least 32 in a Pi-owned `autoMode` config. The former `maxTranscriptLines` setting is no longer supported.
 
+### Classifier request timeout
+
+`classifierTimeoutMs` caps each classifier completion request in milliseconds. The fast and detailed stages are separate requests, and each gets its own budget. Default: 20000. When a request exceeds the budget — for example a provider stream that stalls mid-response — the attempt is aborted and auto mode fails closed, blocking the action. Override with an integer of at least 1000 in a Pi-owned `autoMode` config.
+
 ### Replacement behavior
 
 Use `$defaults` when you want to keep the built-ins and add your own entries:

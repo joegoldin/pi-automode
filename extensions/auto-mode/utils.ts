@@ -30,7 +30,15 @@ export function safeJson(value: unknown, maxLength = 4000): string {
             Math.max(200, Math.floor(maxLength / 4)),
           );
         }
-        if (Array.isArray(current)) return current.slice(0, 30);
+        if (Array.isArray(current)) {
+          if (current.length <= 30) return current;
+          return {
+            $truncatedArray: true,
+            items: current.slice(0, 30),
+            omittedEntries: current.length - 30,
+            totalEntries: current.length,
+          };
+        }
         if (current && typeof current === "object") {
           if (seen.has(current)) return "[Circular]";
           seen.add(current);

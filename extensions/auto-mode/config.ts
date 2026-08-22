@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import {
   DEFAULT_ALLOW,
   DEFAULT_ALLOW_INSIDE_WORKING_DIRECTORY,
+  DEFAULT_CLASSIFIER_TIMEOUT_MS,
   DEFAULT_CLASSIFY_READ_ONLY_TOOLS,
   DEFAULT_DENIED_PATHS,
   DEFAULT_ENVIRONMENT,
@@ -103,6 +104,7 @@ export function validateSettingsFile(
         "enabled",
         "classifierModel",
         "classifierReasoningLevel",
+        "classifierTimeoutMs",
         "classifyReadOnlyTools",
         "fastClassifierMaxTokens",
         "allowInsideWorkingDirectory",
@@ -142,6 +144,15 @@ export function validateSettingsFile(
       ) {
         diagnostics.push(
           `${source}: autoMode.classifierReasoningLevel must be one of low, medium, high, xhigh, max`,
+        );
+      }
+      if (
+        hasOwn(autoMode, "classifierTimeoutMs") &&
+        (!Number.isInteger(autoMode.classifierTimeoutMs) ||
+          (autoMode.classifierTimeoutMs as number) < 1000)
+      ) {
+        diagnostics.push(
+          `${source}: autoMode.classifierTimeoutMs must be an integer of at least 1000`,
         );
       }
       if (
@@ -386,6 +397,10 @@ function validFastClassifierBudget(value: unknown): value is number {
   return Number.isInteger(value) && Number(value) >= 16;
 }
 
+function validClassifierTimeout(value: unknown): value is number {
+  return Number.isInteger(value) && Number(value) >= 1000;
+}
+
 function applyAutoModeScalars(
   base: EffectiveConfig,
   settings: AutoModeSettings | undefined,
@@ -409,6 +424,9 @@ function applyAutoModeScalars(
       )
       ? settings.fastClassifierMaxTokens
       : base.fastClassifierMaxTokens,
+    classifierTimeoutMs: validClassifierTimeout(settings.classifierTimeoutMs)
+      ? settings.classifierTimeoutMs
+      : base.classifierTimeoutMs,
     maxUserTranscriptTokens: validTranscriptBudget(
         settings.maxUserTranscriptTokens,
       )
@@ -454,6 +472,7 @@ export function buildEffectiveConfigFromSources(
     allowInsideWorkingDirectory: DEFAULT_ALLOW_INSIDE_WORKING_DIRECTORY,
     deniedPaths: [...DEFAULT_DENIED_PATHS],
     fastClassifierMaxTokens: DEFAULT_FAST_CLASSIFIER_MAX_TOKENS,
+    classifierTimeoutMs: DEFAULT_CLASSIFIER_TIMEOUT_MS,
     maxUserTranscriptTokens: DEFAULT_MAX_USER_TRANSCRIPT_TOKENS,
     maxToolTranscriptTokens: DEFAULT_MAX_TOOL_TRANSCRIPT_TOKENS,
     environment: [...DEFAULT_ENVIRONMENT],

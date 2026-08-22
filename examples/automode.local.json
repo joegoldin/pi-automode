@@ -1,6 +1,7 @@
 {
   "autoMode": {
     "classifierReasoningLevel": "low",
+    "classifierTimeoutMs": 20000,
     "allowInsideWorkingDirectory": false,
     "deniedPaths": [
       "*.env",

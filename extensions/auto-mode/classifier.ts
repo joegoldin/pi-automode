@@ -113,6 +113,7 @@ export type ClassifierCompletionFn = (
     signal?: AbortSignal;
     maxTokens: number;
     temperature?: number;
+    timeoutMs?: number;
     reasoning?: Exclude<EffectiveClassifierReasoningLevel, "off">;
     sessionId?: string;
     cacheRetention?: "none" | "short" | "long";
@@ -123,6 +124,8 @@ export type RetryOptions = {
   maxAttempts?: number;
   maxTokens?: number;
   temperature?: number;
+  /** Per-request timeout in milliseconds; falls back to the provider default when undefined. */
+  timeoutMs?: number;
   reasoningLevel?: Exclude<EffectiveClassifierReasoningLevel, "off">;
   sessionId?: string;
   cacheRetention?: "none" | "short" | "long";
@@ -135,6 +138,8 @@ export type StagedClassifierOptions = {
   sessionId: string;
   /** Override the fast-stage token budget; falls back to the default (512). */
   fastClassifierMaxTokens?: number;
+  /** Per-request timeout in milliseconds; falls back to the provider default when undefined. */
+  timeoutMs?: number;
   reasoningLevel?: Exclude<EffectiveClassifierReasoningLevel, "off">;
   onAttempt?: (attempt: ClassifierIoAttempt) => void;
 };
@@ -331,6 +336,7 @@ export async function classifyWithRetry(
           signal,
           maxTokens,
           ...(temperature === undefined ? {} : { temperature }),
+          ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
           ...(options.reasoningLevel === undefined
             ? {}
             : { reasoning: options.reasoningLevel }),
@@ -405,6 +411,9 @@ export async function classifyInStages(
         ...(options.reasoningLevel === undefined
           ? {}
           : { reasoning: options.reasoningLevel }),
+        ...(options.timeoutMs === undefined
+          ? {}
+          : { timeoutMs: options.timeoutMs }),
         sessionId: options.sessionId,
         cacheRetention: "short",
       },
@@ -468,6 +477,7 @@ export async function classifyInStages(
       stage: "detailed",
       sessionId: options.sessionId,
       cacheRetention: "short",
+      timeoutMs: options.timeoutMs,
       reasoningLevel: options.reasoningLevel,
       onAttempt: options.onAttempt,
     },
@@ -525,6 +535,7 @@ export const defaultClassifyAction: ClassifyAction = async (
     {
       sessionId: classifierCacheSessionId(ctx),
       fastClassifierMaxTokens: config.fastClassifierMaxTokens,
+      timeoutMs: config.classifierTimeoutMs,
       reasoningLevel: completionPlan.reasoningLevel,
       onAttempt: (attempt) => attempts.push(attempt),
     },
